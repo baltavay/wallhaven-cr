@@ -1,0 +1,5 @@
+/bin/
+/lib/
+/.crystal/
+*.png
+!assets/**/*.png

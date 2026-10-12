@@ -1,0 +1,22 @@
+name: wallhaven-cr
+version: 0.1.0
+description: |
+  Wallhaven client and wallpaper manager for Omarchy.
+  Immediate-mode GUI (raylib + raygui), SQLite storage, background download/crop jobs.
+
+authors:
+  - idontcare
+
+targets:
+  wallhaven-cr:
+    main: src/main.cr
+
+dependencies:
+  raylib-cr:
+    github: sol-vin/raylib-cr
+  sqlite3:
+    github: crystal-lang/crystal-sqlite3
+
+crystal: ">= 1.15.0"
+
+license: MIT

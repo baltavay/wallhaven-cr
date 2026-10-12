@@ -1,0 +1,14 @@
+version: 2.0
+shards:
+  db:
+    git: https://github.com/crystal-lang/crystal-db.git
+    version: 0.15.0
+
+  raylib-cr:
+    git: https://github.com/sol-vin/raylib-cr.git
+    version: 6.0+git.commit.fdcf0729050f5f88ffcafa5675d229a5592ab304
+
+  sqlite3:
+    git: https://github.com/crystal-lang/crystal-sqlite3.git
+    version: 0.24.0
+
