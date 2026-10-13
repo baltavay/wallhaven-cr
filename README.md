@@ -18,6 +18,21 @@ immediate-mode GUI (raylib + raygui). No GTK, no Qt, no webview.
   Favourites grid, Browse, or the Theme view. Adding is idempotent.
 * Add wallpapers that are already on disk.
 
+## Screenshots
+
+Browse wallhaven with the full search surface, against the local library:
+
+![Browse view](assets/screenshots/browse.png)
+
+Favourites as cards, one row per version, with the version to add to the theme
+and the theme chips:
+
+![Favourites view](assets/screenshots/favourites.png)
+
+The crop editor, framed to the target monitor:
+
+![Crop editor](assets/screenshots/crop-editor.png)
+
 ## Requirements
 
 * Crystal >= 1.15 (built and tested with 1.21)
