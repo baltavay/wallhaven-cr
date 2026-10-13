@@ -87,6 +87,30 @@ describe "wallhaven-cr storage" do
     error.not_nil!.should contain "no such file"
   end
 
+  it "remembers which version of a wallpaper goes to the theme" do
+    wallpaper = Wallpaper.new("spec-versioned", "wallhaven")
+    Store.upsert_wallpaper(wallpaper)
+    original = WallpaperFile.new("spec-versioned", "original", "/tmp/orig.jpg", 3840, 2160)
+    original_id = Store.insert_file(original)
+    crop = WallpaperFile.new("spec-versioned", "crop", "/tmp/crop.jpg", 1920, 1080)
+    crop.crop_index = 0_i64
+    crop_id = Store.insert_file(crop)
+
+    files = Store.files_for("spec-versioned")
+    files.map(&.kind).should eq ["original", "crop"]
+
+    # no choice yet -> the original
+    Store.chosen_version_index("spec-versioned", files).should eq 0
+
+    Store.set_theme_choice("spec-versioned", crop_id)
+    Store.chosen_version_index("spec-versioned", files).should eq 1
+
+    # the chosen version disappears -> fall back to the original, not to nil
+    Store.delete_file(crop_id)
+    Store.chosen_version_index("spec-versioned", Store.files_for("spec-versioned")).should eq 0
+    Store.files_for("spec-versioned").first.id.should eq original_id
+  end
+
   it "queues each aether favourite only once, however often the import runs" do
     dir = File.join(ENV["WALLHAVEN_CR_DATA"], "aether-fixture")
     FileUtils.mkdir_p(dir)

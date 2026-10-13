@@ -2,6 +2,7 @@ require "process"
 require "file_utils"
 require "./config"
 require "./spawn"
+require "./atomic_file"
 
 # Image processing, delegated to an external tool.
 #
@@ -27,13 +28,13 @@ module ImageOps
     ImageMagick
   end
 
-  # JPEG quality per use: grid thumbnails are small, crops are the wallpaper.
-  THUMB_QUALITY   = 82
+  # JPEG quality per use: thumbnails/previews are small, crops are the wallpaper.
   PREVIEW_QUALITY = 88
   CROP_QUALITY    = 92
 
   @@backend : Backend?
   @@binary : String?
+  @@counter = Atomic(Int32).new(0)
 
   # Which backend is in use ("vips" or "magick"/"convert").
   def self.backend_name : String
@@ -102,27 +103,16 @@ module ImageOps
     raise Error.new("cannot read #{File.basename(path)}: #{ex.message}")
   end
 
-  # Square centre-cropped grid thumbnail.
-  def self.thumbnail(src : String, dst : String, size : Int32 = 256) : Nil
-    mkdir(dst)
-    if vips?
-      run(@@binary.not_nil!, ["thumbnail", src, with_quality(dst, THUMB_QUALITY),
-        size.to_s, "--height", size.to_s, "--size", "force", "--crop", "centre"])
-    else
-      run(@@binary.not_nil!, [src, "-auto-orient", "-thumbnail", "#{size}x#{size}^",
-        "-gravity", "center", "-extent", "#{size}x#{size}",
-        "-strip", "-quality", THUMB_QUALITY.to_s, dst])
-    end
-  end
-
   # Downscaled preview used by the crop editor (never upscales).
   def self.preview(src : String, dst : String, max : Int32 = 2048) : Nil
     mkdir(dst)
-    if vips?
-      run(@@binary.not_nil!, ["thumbnail", src, with_quality(dst, PREVIEW_QUALITY), max.to_s, "--size", "down"])
-    else
-      run(@@binary.not_nil!, [src, "-auto-orient", "-resize", "#{max}x#{max}>",
-        "-strip", "-quality", PREVIEW_QUALITY.to_s, dst])
+    AtomicFile.write(dst) do |target|
+      if vips?
+        run(@@binary.not_nil!, ["thumbnail", src, with_quality(target, PREVIEW_QUALITY), max.to_s, "--size", "down"])
+      else
+        run(@@binary.not_nil!, [src, "-auto-orient", "-resize", "#{max}x#{max}>",
+          "-strip", "-quality", PREVIEW_QUALITY.to_s, target])
+      end
     end
   end
 
@@ -141,17 +131,22 @@ module ImageOps
       # native format, written next to the output (real disk, not /tmp which is
       # tmpfs here) and removed immediately.
       # The suffix must be `.v`: libvips picks the format from it.
-      tmp = File.join(File.dirname(dst), ".#{File.basename(dst, File.extname(dst))}.#{Process.pid}.v")
+      vtmp = File.join(File.dirname(dst),
+        ".#{File.basename(dst, File.extname(dst))}.#{Process.pid}.#{@@counter.add(1)}.v")
       begin
-        run(@@binary.not_nil!, ["crop", src, tmp, x.to_s, y.to_s, w.to_s, h.to_s])
-        run(@@binary.not_nil!, ["resize", tmp, with_quality(dst, quality),
-          (out_w.to_f64 / w).to_s, "--vscale", (out_h.to_f64 / h).to_s])
+        run(@@binary.not_nil!, ["crop", src, vtmp, x.to_s, y.to_s, w.to_s, h.to_s])
+        AtomicFile.write(dst) do |target|
+          run(@@binary.not_nil!, ["resize", vtmp, with_quality(target, quality),
+            (out_w.to_f64 / w).to_s, "--vscale", (out_h.to_f64 / h).to_s])
+        end
       ensure
-        File.delete(tmp) if File.exists?(tmp)
+        File.delete(vtmp) if File.exists?(vtmp)
       end
     else
-      run(@@binary.not_nil!, [src, "-auto-orient", "-crop", "#{w}x#{h}+#{x}+#{y}", "+repage",
-        "-resize", "#{out_w}x#{out_h}!", "-strip", "-quality", quality.to_s, dst])
+      AtomicFile.write(dst) do |target|
+        run(@@binary.not_nil!, [src, "-auto-orient", "-crop", "#{w}x#{h}+#{x}+#{y}", "+repage",
+          "-resize", "#{out_w}x#{out_h}!", "-strip", "-quality", quality.to_s, target])
+      end
     end
   end
 

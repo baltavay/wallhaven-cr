@@ -7,14 +7,46 @@ immediate-mode GUI (raylib + raygui). No GTK, no Qt, no webview.
   people), purity (SFW / sketchy / NSFW), sorting and order, toplist range,
   `atleast` minimum size, exact resolutions, aspect ratio and colour filter.
 * Favourites are downloaded in the background (SQLite job queue, one worker
-  thread) and get grid thumbnails.
+  thread) and get thumbnails: whole-image, fitted ones everywhere — Favourites,
+  Browse, the detail panel and the Theme view — drawn through mipmaps so fine
+  detail does not alias. Nothing is cropped or stretched; a wallpaper that is not
+  downloaded yet uses wallhaven's aspect-preserving `thumbs.original` rather than
+  its fixed-aspect `small`/`large` crops. The thumbnail job writes the same cache
+  entry the views read, so a fresh download appears in the grid immediately.
+* Thumbnails come from whichever source is already ready: wallhaven's own JPEG is
+  cached **byte for byte** (no re-encode) when there is no local file, and only
+  local-only images (crops, imported files) are rendered through vips. Three
+  workers generate thumbnails in parallel, because the cost is network latency and
+  one image-tool process per file, not CPU. Measured on a cold 14-tile Browse
+  screen: 1.4 s, ~100 ms per tile; re-encoding each fetched thumbnail through vips
+  was the bulk of the old cost.
 * Crop editor: zoom with the scroll wheel or the zoom bar, drag the image under
   a frame locked to the target monitor's aspect ratio, and write a version at
   exactly that monitor's pixel size.
 * Every wallpaper keeps its original plus any number of cropped versions; each
   version is a separate row and can be deleted on its own.
-* Add favourites (originals and versions) to the current Omarchy theme with one
-  copy into `~/.local/share/omarchy/current/theme/backgrounds`.
+* Add favourites (originals and versions) to the current Omarchy theme: one copy
+  into `~/.config/omarchy/backgrounds/<theme>/`, the per-theme folder
+  `omarchy-theme-set` searches first and does not wipe. (The staged copy under
+  `~/.local/state/omarchy/current/theme/` is deleted and recreated on every theme
+  set, so writing there loses the file; and names must keep an image extension,
+  because the wallpaper search matches `*.jpg`/`*.png`/... — both were bugs
+  here.) The added file joins the theme's wallpaper rotation, which advances the
+  next time the theme is applied. Adding is idempotent: each version gets a
+  stable name (`wallhaven-<id>.jpg` for the original, `wallhaven-<id>-crop1.jpg`
+  for its cropped versions) and identity is the file's **content** (size, then
+  SHA-1), so re-adding the same version reports "already in the theme" and copies
+  nothing, while a genuinely different version is kept as a numbered sibling.
+  Set `WALLHAVEN_CR_THEME_DIR` to redirect the target folder.
+
+  Removing works the same way, in two places: the version rows in Favourites and
+  Browse toggle between `add` and `remove` (removing deletes every copy of that
+  version's *content*, so a duplicate under an older name goes too; the library
+  copy stays, so it can be added again), and the Theme view lists the theme
+  folder as thumbnail cards (whole images, aspect preserved — see `src/ui/fit.cr`)
+  with a `delete from theme` chip per file — two presses, because that list
+  also contains wallpapers added by hand. Files that live only in omarchy's
+  staging copy are marked `staging only` and are not deletable.
 * Add wallpapers that are already on disk.
 
 ## Layout
@@ -105,7 +137,10 @@ guarantees its fiber always runs on the same system thread, and the window is
 created *there*. `App#run` also re-checks the thread identity every frame: if it
 ever changed, the loop stops before touching GL again and prints a diagnostic
 instead of dying with an unexplained SIGSEGV. Workers stay in their own contexts
-(`wh-jobs`, `wh-thumbs`, `wh-previews`, `wh-search`) and never call raylib.
+(`wh-jobs`, `wh-thumbs`, `wh-previews`, `wh-search`) and never call raylib. The
+thumbnail cache keeps three `wh-thumbs*` contexts: they are latency-bound (an HTTP
+fetch each) and each forces one image-tool process, so running them one at a time
+only serialises waiting.
 
 ## How the background work runs
 

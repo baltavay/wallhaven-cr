@@ -48,12 +48,6 @@ describe ImageOps do
     ImageOps.identify(ImageFixture.source).should eq({2000_i64, 1200_i64})
   end
 
-  it "writes a square, centre-cropped grid thumbnail" do
-    dst = File.join(ImageFixture.dir, "thumb.jpg")
-    ImageOps.thumbnail(ImageFixture.source, dst, 256)
-    ImageOps.identify(dst).should eq({256_i64, 256_i64})
-  end
-
   it "bounds the editor preview and never upscales it" do
     dst = File.join(ImageFixture.dir, "preview.jpg")
     ImageOps.preview(ImageFixture.source, dst, 640)
@@ -77,9 +71,9 @@ describe ImageOps do
     FileUtils.mkdir_p(dir)
     ImageOps.crop_resize(ImageFixture.source, File.join(dir, "version.jpg"),
       {0_i64, 0_i64, 1000_i64, 600_i64}, 1280, 768)
-    ImageOps.thumbnail(ImageFixture.source, File.join(dir, "grid.jpg"), 128)
+    ImageOps.preview(ImageFixture.source, File.join(dir, "thumb.jpg"), 128)
 
-    Dir.children(dir).sort.should eq ["grid.jpg", "version.jpg"]
+    Dir.children(dir).sort.should eq ["thumb.jpg", "version.jpg"]
   end
 
   it "raises a readable error for a file it cannot read" do

@@ -33,6 +33,11 @@ module Ui
     DETAIL_W = 300
 
     def draw_browse : Nil
+      if @filters_changed
+        @filters_changed = false
+        persist_filters
+        start_search(1)
+      end
       w = Raylib.get_screen_width
       h = Raylib.get_screen_height
       filter_h = draw_filters(w)
@@ -111,42 +116,33 @@ module Ui
         persist_filters
       end
 
-      colour_rec = flow.place(70_f32, 84_f32, 28_f32)
-      text("colour", colour_rec.x.to_i, (colour_rec.y - 15).to_i, 12, MUTED)
-      if text_entry(colour_rec, @f_colors, 2, 10)
-        persist_filters
+      # colour: a picker, not a hex string
+      colour_rec = flow.place(80_f32, 44_f32, 28_f32)
+      current = @f_colors.value.strip
+      text(current.empty? ? "colour" : "colour ##{current}", colour_rec.x.to_i, (colour_rec.y - 15).to_i, 12, MUTED)
+      shown = Ui.parse_hex(current) || CARD
+      if swatch(colour_rec, shown)
+        if @color_picker_open && @frame > @color_picker_opened_frame
+          # clicking the swatch again closes it
+          close_color_picker
+        else
+          close_overlays
+          @color_picker_open = true
+          @color_picker_anchor = colour_rec
+          @color_picker_opened_frame = @frame
+          @picker_color = Ui.parse_hex(current) || Raylib::Color.new(r: 122_u8, g: 162_u8, b: 247_u8, a: 255_u8)
+        end
       end
-      swatch_rec = flow.place(30_f32, 26_f32, 28_f32)
-      if swatch(swatch_rec, Raylib::Color.new(r: 179, g: 56, b: 56, a: 255))
-        set_color("b33838")
-      end
-      if swatch(flow.place(30_f32, 26_f32, 28_f32), Raylib::Color.new(r: 62, g: 94, b: 168, a: 255))
-        set_color("3e5ea8")
-      end
-      if button(flow.place(60_f32, 70_f32, 28_f32), "clear")
-        @f_colors.value = ""
-        persist_filters
+      if !current.empty?
+        if button(flow.place(60_f32, 64_f32, 28_f32), "clear")
+          @f_colors.value = ""
+          persist_filters
+          start_search(1)
+        end
       end
 
       @filter_height = flow.height.to_i32
       @filter_height
-    end
-
-    # raygui dropdowns need the caller to own the "list is open" flag.
-    # Returns true on the frame an item is committed.
-    def dropdown(rec : Raylib::Rectangle, items : String, active : Int32*, open : Bool*) : Bool
-      # raygui draws a dropdown even with a single entry but will not open it;
-      # draw it so the value is visible and skip the toggle logic.
-      if items.split(';').size <= 1
-        Raygui.dropdown_box(rec, items, active, false)
-        return false
-      end
-      if Raygui.dropdown_box(rec, items, active, open.value) == 1
-        changed = open.value
-        open.value = !open.value
-        return changed
-      end
-      false
     end
 
     # Multi-select toggle chip: raygui's checkbox gives no clear on/off contrast
@@ -166,12 +162,6 @@ module Ui
         active.value = !on
       end
       rec
-    end
-
-    def set_color(hex : String) : Nil
-      @f_colors.value = hex
-      persist_filters
-      start_search(1)
     end
 
     def swatch(rec : Raylib::Rectangle, color : Raylib::Color) : Bool
@@ -203,11 +193,20 @@ module Ui
       height = bottom - top
       return if width < 80 || height < 80
 
-      cell = 180
+      # Whole-image tiles, like the Favourites cards: a square centre crop hid most
+      # of a wide wallpaper and double-cropped the ones that were not downloaded
+      # (wallhaven's own thumbs are fixed-aspect crops).
       gap = 12
-      columns = [1, (width + gap) // (cell + gap)].max
+      # Aim for ~190 px wide tiles: dense enough to scan results, and at or below the
+      # resolution of the sources (a local 448 px fit thumb, or wallhaven's ~300 px
+      # fit thumb), so nothing is upscaled.
+      columns_tmp = [1, (width + gap) // (190 + gap)].max
+      cell_w = (width - gap * (columns_tmp + 1)) // columns_tmp
+      cell = cell_w
+      cell_h = (cell_w * 9) // 16
+      columns = columns_tmp
       rows = (@results.size + columns - 1) // columns
-      content_h = rows * (cell + gap) + gap
+      content_h = rows * (cell_h + gap) + gap
 
       auto_scroll(height, content_h)
 
@@ -220,10 +219,10 @@ module Ui
       @results.each_with_index do |wallpaper, index|
         col = index % columns
         row = index // columns
-        cx = left + col * (cell + gap)
-        cy = top + gap + row * (cell + gap) - @grid_scroll
-        next if cy + cell < top - cell || cy > bottom
-        draw_cell(wallpaper, Ui.rect(cx, cy, cell, cell))
+        cx = left + gap + col * (cell + gap)
+        cy = top + gap + row * (cell_h + gap) - @grid_scroll
+        next if cy + cell_h < top - cell_h || cy > bottom
+        draw_cell(wallpaper, Ui.rect(cx, cy, cell, cell_h))
       end
       Raylib.end_scissor_mode
       draw_scrollbar(right - 6, top, height, content_h)
@@ -235,16 +234,15 @@ module Ui
       selected = @selected.try(&.id) == wallpaper.id
 
       Raylib.draw_rectangle_rec(rec, CARD)
-      thumb = @thumbs.fetch("w-#{wallpaper.id}", wallpaper.original_file.try(&.path), wallpaper.remote_thumb)
+      original = wallpaper.original_file
+      thumb = @fit_thumbs.fetch(fit_thumb_key(wallpaper, original), original.try(&.path), wallpaper.remote_fit_thumb)
       drawn = false
       if thumb && (tex = texture(thumb))
-        # cover-fit inside the cell
-        scale = [rec.width / tex.width.to_f32, rec.height / tex.height.to_f32].max
-        dw = tex.width * scale
-        dh = tex.height * scale
-        source = Raylib::Rectangle.new(x: (dw - rec.width) / (2 * scale), y: (dh - rec.height) / (2 * scale),
-          width: rec.width / scale, height: rec.height / scale)
-        Raylib.draw_texture_pro(tex, source, rec, Raylib::Vector2.new(x: 0_f32, y: 0_f32), 0_f32, Raylib::WHITE)
+        # the whole wallpaper, aspect preserved, centred in the tile
+        dx, dy, dw, dh = Ui::Fit.contain(rec.x, rec.y, rec.width, rec.height,
+          tex.width.to_f32, tex.height.to_f32)
+        Raylib.draw_texture_pro(tex, Ui.rect(0, 0, tex.width, tex.height), Ui.rect(dx, dy, dw, dh),
+          Raylib::Vector2.new(x: 0_f32, y: 0_f32), 0_f32, Raylib::WHITE)
         drawn = true
       end
 
@@ -288,7 +286,8 @@ module Ui
       y = top + 14
       preview = Ui.rect(x + 12, y, w - 24, 180)
       Raylib.draw_rectangle_rec(preview, CARD)
-      thumb = @thumbs.fetch("w-#{wallpaper.id}", wallpaper.original_file.try(&.path), wallpaper.remote_thumb)
+      original = wallpaper.original_file
+      thumb = @fit_thumbs.fetch(fit_thumb_key(wallpaper, original), original.try(&.path), wallpaper.remote_fit_thumb)
       if thumb && (tex = texture(thumb))
         scale = [preview.width / tex.width.to_f32, preview.height / tex.height.to_f32].min
         dw = tex.width * scale
@@ -322,8 +321,12 @@ module Ui
       y += 38
 
       if path = wallpaper.original_file.try(&.path)
-        if File.exists?(path) && button(Ui.rect(x + 14, y, w - 28, 32), "Add to current theme")
-          add_to_theme(path, theme_name_for(wallpaper))
+        if File.exists?(path)
+          chosen = chosen_file(wallpaper)
+          label = chosen && in_theme?(wallpaper, chosen) ? "In theme" : "Add #{chosen_label(wallpaper)} to theme"
+          if button(Ui.rect(x + 14, y, w - 28, 32), label)
+            add_chosen_to_theme(wallpaper)
+          end
         end
       end
       y += 38
@@ -341,30 +344,13 @@ module Ui
       files = @detail_files
       if files.empty?
         text("no local files yet", x + 14, y, 13, MUTED)
+        return
       end
-      files.each do |file|
-        text(file.label, x + 14, y, 13, file.exists? ? TEXT : ERR)
-        text("#{file.file_size // 1024} KiB", x + 14, y + 15, 12, MUTED)
-        if file.kind == "crop"
-          if small_button(Ui.rect(x + w - 74, y - 2, 60, 24), "delete")
-            File.delete(file.path) if File.exists?(file.path)
-            Store.delete_file(file.id)
-            say "deleted #{File.basename(file.path)}", MUTED
-          end
-        elsif file.exists?
-          if small_button(Ui.rect(x + w - 74, y - 2, 60, 24), "theme")
-            add_to_theme(file.path, theme_name_for(wallpaper))
-          end
-        end
-        y += 34
-      end
+      text("version to use:", x + 14, y, 13, TEXT)
+      y += 20
+      version_rows(wallpaper, files, (x + 14).to_f32, y.to_f32, (w - 28).to_f32, allow_delete: true)
     end
 
-    def theme_name_for(wallpaper : Wallpaper) : String
-      base = "wallhaven-#{wallpaper.id}"
-      base = wallpaper.id unless wallpaper.source == "wallhaven"
-      base
-    end
 
     def small_button(rec : Raylib::Rectangle, label : String) : Bool
       Raygui.set_style(Raygui::Control::Default.value, Raygui::DefaultProperty::TextSize.value, 14)
@@ -376,7 +362,9 @@ module Ui
     # ---- scrolling helpers
 
     def auto_scroll(viewport_h : Int32, content_h : Int32) : Nil
-      wheel = Raylib.get_mouse_wheel_move
+      # Same input gate as the buttons: a wheel event from an unfocused window
+      # should not scroll anything.
+      wheel = input_ready? ? Raylib.get_mouse_wheel_move : 0_f32
       @grid_scroll -= wheel * 60_f32 if wheel != 0_f32
       max = [0_f32, (content_h - viewport_h).to_f32].max
       @grid_scroll = @grid_scroll.clamp(0_f32, max)

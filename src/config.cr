@@ -57,6 +57,28 @@ module Config
     File.join(data_dir, "wallhaven.db")
   end
 
+  # Whole-image ("fit") thumbnails: ~1.5x the widest card, so tiles stay crisp when
+  # scaled down through mipmaps.
+  FIT_THUMB_SIZE = 448
+
+  def self.thumb_cache_dir : String
+    dir = File.join(thumbs_dir, "cache")
+    FileUtils.mkdir_p(dir)
+    dir
+  end
+
+  # Cache key for a wallpaper version's whole-image thumbnail. Stable for a given
+  # version, so re-adding or re-downloading produces a new entry.
+  def self.fit_thumb_key(wallpaper_id : String, file_id : Int64?) : String
+    "favfit-#{wallpaper_id}-#{file_id || 0}"
+  end
+
+  # Where a cache key lives on disk (keys can contain characters that need hiding,
+  # e.g. file names from the theme folder).
+  def self.thumb_cache_path(key : String) : String
+    File.join(thumb_cache_dir, "#{key.gsub(/[^A-Za-z0-9._-]+/, "_")}.jpg")
+  end
+
   # Load settings, creating the file on first run.
   def self.load : Settings
     FileUtils.mkdir_p(CONFIG_DIR)
@@ -105,6 +127,9 @@ class Settings
 
   # Number of result pages fetched and merged per search.
   property pages_per_search : Int32 = 1
+
+  # Where the Favourites grid was scrolled to, so it is restored on the next run.
+  property favorites_scroll : Float32 = 0_f32
 
   def initialize
   end

@@ -149,8 +149,8 @@ module Jobs
   def self.requeue_stale : Int32
     # A killed download leaves a `.part` file behind; the job is requeued, so
     # the leftover would only waste disk space.
-    Dir.glob(File.join(Config.originals_dir, "*.part")).each do |stale|
-      File.delete(stale) if File.exists?(stale)
+    {Config.originals_dir, Config.crops_dir, Config.thumbs_dir}.each do |dir|
+      AtomicFile.stale(dir).each { |stale| File.delete(stale) if File.exists?(stale) }
     end
 
     n = Db.conn.exec("UPDATE jobs SET status = 'queued' WHERE status = 'running' AND attempts < ?", MAX_ATTEMPTS).rows_affected
@@ -279,15 +279,12 @@ module Jobs
     raise "file #{file_id} not found" unless file
     raise "source missing: #{file.path}" unless File.exists?(file.path)
 
-    dest = File.join(Config.thumbs_dir, "#{file_id}.jpg")
+    # The one thumbnail the UI actually loads: the whole-image one in the shared
+    # cache, under the same key the views ask for. Generating it here means a freshly
+    # downloaded wallpaper appears in the grid without a second pass.
+    dest = Config.thumb_cache_path(Config.fit_thumb_key(file.wallpaper_id, file_id))
     note(job, "thumbnail #{File.basename(file.path)}")
-    ImageOps.thumbnail(file.path, dest)
-
-    # Originals also get a bounded preview for the crop editor.
-    if file.kind == "original"
-      preview = File.join(Config.thumbs_dir, "preview-#{file_id}.jpg")
-      ImageOps.preview(file.path, preview, 2048)
-    end
+    ImageOps.preview(file.path, dest, Config::FIT_THUMB_SIZE)
     succeed(job, File.basename(dest))
   end
 

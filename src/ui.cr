@@ -7,6 +7,9 @@ require "./jobs"
 require "./monitors"
 require "./aether_import"
 require "./ui/thumbs"
+require "./ui/zoom"
+require "./ui/fit"
+require "./ui/popup"
 
 # raylib + raygui immediate-mode front end.
 #
@@ -32,6 +35,30 @@ module Ui
     points = (32..0x2FF).to_a + (0x400..0x4FF).to_a
     points.concat([0x2013, 0x2014, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2026, 0x2192, 0x00B7])
     points
+  end
+
+  # A dropdown whose option list must be drawn last (see App#draw_open_dropdown):
+  # raygui draws an expanded dropdown inline, which puts its options underneath
+  # anything drawn afterwards — the thumbnail grid in Browse did exactly that.
+  record OpenDropdown,
+    bounds : Raylib::Rectangle,
+    items : Array(String),
+    active : Int32*,
+    open : Bool*
+
+  # Colour <-> the hex string wallhaven's API expects (no leading '#').
+  def self.hex(color : Raylib::Color) : String
+    "%02x%02x%02x" % {color.r, color.g, color.b}
+  end
+
+  def self.parse_hex(text : String) : Raylib::Color?
+    hex = text.strip.lstrip('#')
+    return nil unless hex.size == 6
+    return nil unless hex.each_char.all? { |ch| ch.ascii_number? || ('a'..'f').includes?(ch.downcase) }
+    Raylib::Color.new(r: hex[0, 2].to_i(16).to_u8, g: hex[2, 2].to_i(16).to_u8,
+      b: hex[4, 2].to_i(16).to_u8, a: 255_u8)
+  rescue
+    nil
   end
 
   # Dark palette, loosely following the Omarchy look.
@@ -91,7 +118,6 @@ module Ui
     end
 
     SIDEBAR_W  = 208
-    THUMB_SIZE = 256
 
     # ---- state
     @view : View = View::Browse
@@ -156,6 +182,10 @@ module Ui
     @editor_preview_dims : Tuple(Int32, Int32)?
     @editor_crop_rect : NamedTuple(x: Int64, y: Int64, w: Int64, h: Int64, out_w: Int32, out_h: Int32, target: String)?
     @editor_min_zoom : Float32 = 1_f32
+    @editor_frame : Raylib::Rectangle?
+    @editor_zoom_applied : Float32 = 1_f32
+    @editor_zoom_wanted : Float32?
+    @editor_zoom_anchor : Raylib::Vector2?
     @editor_zoom : Float32 = 1_f32
     @editor_pan : Raylib::Vector2 = Raylib::Vector2.new(x: 0_f32, y: 0_f32)
     @editor_dragging : Bool = false
@@ -164,6 +194,22 @@ module Ui
     @monitors : Array(Monitors::Monitor) = [] of Monitors::Monitor
     @detail_crops = {} of String => Array(WallpaperFile)
     @filter_height : Int32 = 158
+    @theme_names = Set(String).new
+    @version_choice = {} of String => Int32
+    @theme_delete_armed : String?
+    # Whether the armed file can be added again from the library.
+    @theme_delete_recoverable : Bool = true
+
+    # Overlay state: an open dropdown or colour picker is drawn after every view,
+    # so nothing can cover it.
+    @open_dropdown : Ui::OpenDropdown?
+    @filters_changed : Bool = false
+    @color_picker_open : Bool = false
+    @color_picker_anchor : Raylib::Rectangle?
+    @color_picker_opened_frame : Int32 = -1
+    @color_picker_dirty : Bool = false
+    @picker_color : Raylib::Color = Raylib::Color.new(r: 122_u8, g: 162_u8, b: 247_u8, a: 255_u8)
+    @theme_entries = [] of Omarchy::BackgroundEntry
     @import_confirm_deadline : Int32 = 0
 
     # file picker
@@ -175,8 +221,10 @@ module Ui
     @f_picker_path : Field
     @theme_scroll : Float32 = 0_f32
 
-    @thumbs : ThumbCache
     @previews : ThumbCache
+    # Whole-image thumbnails for every view: cards, the browse grid and the detail
+    # preview all show the actual wallpaper.
+    @fit_thumbs : ThumbCache
     @font : Raylib::Font = Raylib::Font.new
     @using_custom_font : Bool = false
     @textures = {} of String => Raylib::Texture2D
@@ -212,8 +260,10 @@ module Ui
       @atleast = Wallhaven::AT_LEAST.index(@settings.at_least) || 0
       @resolution = Wallhaven::RESOLUTIONS.index(@settings.resolutions) || 0
       @ratio = Wallhaven::RATIOS.values.index(@settings.ratios) || 0
-      @thumbs = ThumbCache.new(THUMB_SIZE)
-      @previews = ThumbCache.new(2048, :preview)
+      @previews = ThumbCache.new(2048, "wh-previews")
+      # 448 px is ~1.5x the widest card (~340 px), enough to stay crisp when scaled
+      # down through mipmaps without keeping half a gigabyte of textures alive.
+      @fit_thumbs = ThumbCache.new(Config::FIT_THUMB_SIZE, "wh-thumbs")
       @monitors = Monitors.all
       @editor_target = (@monitors.first? || Monitors::FALLBACK).name
       @search_request = Channel(Wallhaven::Query).new(4)
@@ -342,12 +392,17 @@ module Ui
         return tex
       end
       return nil unless File.exists?(path)
-      tex = Raylib.load_texture(path)
-      return nil if tex.id == 0
-      Raylib.set_texture_filter(tex, Raylib::TextureFilter::Bilinear.value)
-      @textures[path] = tex
+      loaded = Raylib.load_texture(path)
+      return nil if loaded.id == 0
+      # Mipmaps + trilinear: thumbnails are usually drawn smaller than they are
+      # cached (a 640 px thumbnail in a 284 px card), and plain bilinear
+      # minification aliases fine detail — screentones in anime wallpapers turn
+      # into a visible dot pattern. Mip levels are box-filtered, so they don't.
+      Raylib.gen_texture_mipmaps(pointerof(loaded))
+      Raylib.set_texture_filter(loaded, Raylib::TextureFilter::Trilinear.value)
+      @textures[path] = loaded
       @texture_used << path
-      tex
+      loaded
     end
 
     # Called once per frame, before drawing starts. Deleting a texture while a
@@ -374,6 +429,10 @@ module Ui
     # which would "click" whatever is under the pointer. Ignore input until the
     # window has settled.
     INPUT_SETTLE_FRAMES = 4
+
+    # Row pitch of the version list (Favourites cards and the Browse detail panel
+    # share it).
+    VERSION_ROW_H = 22_f32
 
     # Input is ignored until the window has settled and only while it has focus:
     # an X11/XWayland window that never receives focus can report a stale mouse
@@ -447,6 +506,7 @@ module Ui
       Jobs.start
       refresh_favorites
       refresh_theme_info
+      @fav_scroll = @settings.favorites_scroll
       say "ready · #{Store.count_wallpapers} wallpapers · #{Store.count_favorites} favourites"
       autoload if @results.empty?
       apply_start_view(@start_view)
@@ -506,8 +566,9 @@ module Ui
     # threads that are still alive — the shape of a SIGSEGV inside
     # libGLdispatch.
     private def shutdown : Nil
-      @thumbs.stop
+      save_view_state
       @previews.stop
+      @fit_thumbs.stop
       Jobs.stop
       # With the context no longer owned by this thread, freeing GL objects or
       # closing the window would fault; leave the process to exit.
@@ -571,13 +632,45 @@ module Ui
 
     def refresh_theme_info : Nil
       theme = Omarchy.current_theme_name || "none"
-      count = Omarchy.backgrounds.size
-      @theme_info = "theme: #{theme} · #{count} backgrounds"
+      @theme_entries = Omarchy.background_entries
+      @theme_info = "theme: #{theme} · #{@theme_entries.size} backgrounds"
+      refresh_theme_names
+    end
+
+    # Cache key for a theme file's thumbnail. The size and mtime are part of it so
+    # that replacing a file under the same name produces a fresh thumbnail, and the
+    # "fit" marker keeps these apart from the earlier square-cropped thumbnails of
+    # the same files.
+    def theme_thumb_key(entry : Omarchy::BackgroundEntry) : String
+      "themefit-#{entry.name}-#{entry.size}-#{entry.mtime}"
+    end
+
+    # Whole-image thumbnail key (see Config.fit_thumb_key).
+    def fit_thumb_key(wallpaper : Wallpaper, file : WallpaperFile?) : String
+      Config.fit_thumb_key(wallpaper.id, file.try(&.id))
+    end
+
+    # Scroll positions are part of the view state, exposed so a check can drive them
+    # (the UI itself only reads them while drawing).
+    def favorites_scroll : Float32
+      @fav_scroll
+    end
+
+    def favorites_scroll=(value : Float32)
+      @fav_scroll = value
+    end
+
+    def save_view_state : Nil
+      @settings.favorites_scroll = @fav_scroll
+      Config.save(@settings)
     end
 
     def refresh_favorites : Nil
       @favorites = Store.favorites
       @favorite_ids = Store.favorite_ids
+      # The "already in theme" labels are read from this set, so keep it current
+      # whenever the list itself is reloaded.
+      refresh_theme_names
     end
 
     def favorite_cached?(id : String) : Bool
@@ -684,15 +777,17 @@ module Ui
     end
 
     def view_changed : Nil
+      close_overlays
       case @view
       when View::Favorites
         refresh_favorites
         refresh_detail_crops
-        @fav_scroll = 0_f32
+        # The scroll position is deliberately kept: coming back from the editor or
+        # from Browse should not jump the list back to the top.
       when View::Theme
         refresh_theme_info
       when View::Queue
-        @queue_scroll = 0_f32
+        # likewise kept
       when View::Editor
         # Open with the current selection, or the newest downloaded wallpaper so
         # the editor is never blank.
@@ -718,6 +813,104 @@ module Ui
       when View::Theme     then draw_theme
       end
       draw_picker if @picker_open
+      # Overlays last: an open dropdown list or colour picker must sit above the
+      # grid, the detail panel and everything else.
+      draw_open_dropdown
+      draw_color_picker
+    end
+
+    # The closed control is drawn where it belongs; its options are drawn here.
+    def dropdown(rec : Raylib::Rectangle, items_text : String, active : Int32*, open : Bool*) : Bool
+      items = items_text.split(';')
+      if items.size <= 1
+        Raygui.dropdown_box(rec, items_text, active, false)
+        return false
+      end
+      if Raygui.dropdown_box(rec, items_text, active, false) == 1
+        if open.value
+          close_overlays
+        else
+          close_overlays
+          open.value = true
+          @open_dropdown = Ui::OpenDropdown.new(rec, items, active, open)
+        end
+      end
+      false
+    end
+
+    def close_overlays : Nil
+      if dd = @open_dropdown
+        dd.open.value = false
+        @open_dropdown = nil
+      end
+      close_color_picker
+    end
+
+    def draw_open_dropdown : Nil
+      dd = @open_dropdown
+      return unless dd
+      height = dd.bounds.height
+      list = Ui.rect(dd.bounds.x, dd.bounds.y + height, dd.bounds.width, height * dd.items.size)
+      Raylib.draw_rectangle_rec(list, PANEL)
+      Raylib.draw_rectangle_lines_ex(list, 1_f32, ACCENT)
+      mouse = Raylib.get_mouse_position
+      picked = false
+      dd.items.each_with_index do |item, index|
+        row = Ui.rect(list.x, list.y + height * index, list.width, height)
+        hovered = input_ready? && Raylib.check_collision_point_rec?(mouse, row)
+        Raylib.draw_rectangle_rec(row, ACCENT) if hovered
+        text(item, row.x + 8, row.y + (height - 16) / 2, 16, hovered ? BG : TEXT)
+        if hovered && mouse_pressed?
+          dd.active.value = index
+          @filters_changed = true
+          picked = true
+        end
+      end
+      if picked
+        close_overlays
+      elsif mouse_pressed? && !Raylib.check_collision_point_rec?(mouse, dd.bounds)
+        close_overlays
+      end
+    end
+
+    # Colour picker popup, same overlay pass as the dropdowns.
+    def draw_color_picker : Nil
+      return unless @color_picker_open
+      anchor = @color_picker_anchor || Ui.rect(240_f32, 150_f32, 44_f32, 28_f32)
+      panel = Ui::Popup.below(anchor, 224_f32, 224_f32, 6_f32, Raylib.get_screen_width.to_f32)
+      Raylib.draw_rectangle_rec(panel, PANEL)
+      Raylib.draw_rectangle_lines_ex(panel, 1_f32, ACCENT)
+      Raygui.color_picker(Ui.rect(panel.x + 10, panel.y + 10, panel.width - 20, panel.height - 20), nil, pointerof(@picker_color))
+
+      hex = Ui.hex(@picker_color)
+      if hex != @f_colors.value
+        @f_colors.value = hex
+        @color_picker_dirty = true
+      end
+      text("filter: ##{@f_colors.value}", panel.x + 10, panel.y + panel.height + 4, 13, MUTED)
+
+      # The frame that opened it must not also close it: the opening click is still
+      # pressed now, and it landed on the swatch (outside this panel).
+      return if @frame <= @color_picker_opened_frame
+
+      mouse = Raylib.get_mouse_position
+      inside = Raylib.check_collision_point_rec?(mouse, Ui::Popup.region(anchor, panel))
+      if input_ready? && mouse_pressed? && !inside
+        close_color_picker
+      end
+    end
+
+    def close_color_picker : Nil
+      return unless @color_picker_open
+      @color_picker_open = false
+      @color_picker_anchor = nil
+      # Searching on every drag frame would hammer the API; the filter is applied
+      # once the picker is closed.
+      if @color_picker_dirty
+        @color_picker_dirty = false
+        persist_filters
+        start_search(1)
+      end
     end
 
     # Escape closes the picker; Ctrl+Q and Ctrl+W quit (Escape-to-quit is
@@ -727,6 +920,7 @@ module Ui
       if Raylib.key_pressed?(Raylib::KeyboardKey::Escape)
         @picker_open = false
         @focus_id = 0
+        close_overlays
       end
       ctrl = Raylib.key_down?(Raylib::KeyboardKey::LeftControl) || Raylib.key_down?(Raylib::KeyboardKey::RightControl)
       if ctrl && (Raylib.key_pressed?(Raylib::KeyboardKey::Q) || Raylib.key_pressed?(Raylib::KeyboardKey::W))
@@ -765,11 +959,118 @@ module Ui
     end
 
     def add_to_theme(path : String, name : String? = nil) : Nil
-      dest = Omarchy.add_background(path, name)
+      result = Omarchy.add_background(path, name)
       refresh_theme_info
-      say "added #{File.basename(dest)} to #{Omarchy.current_theme_name || "theme"}", OK
+      refresh_theme_names
+      if result.added?
+        say "added #{File.basename(result.path)} to #{Omarchy.current_theme_name || "theme"}", OK
+      else
+        say "#{File.basename(result.path)} is already in the theme (same version)", MUTED
+      end
     rescue e
       say e.message || "could not add to theme", ERR
+    end
+
+    # Readable, stable stem for a wallpaper's files in the theme folder: the same
+    # convention omarchy itself uses for wallhaven wallpapers.
+    def theme_stem(wallpaper : Wallpaper) : String
+      return "wallhaven-#{wallpaper.id}" if wallpaper.source == "wallhaven"
+      source = wallpaper.page_url.to_s
+      base = source.empty? ? "" : File.basename(source)
+      stem = base.empty? ? wallpaper.id : File.basename(base, File.extname(base))
+      stem.empty? ? wallpaper.id : stem
+    end
+
+    # Add exactly one version (the original, or one crop) of a wallpaper.
+    def add_version_to_theme(wallpaper : Wallpaper, file : WallpaperFile) : Nil
+      crop = file.kind == "crop" ? file.crop_index : nil
+      add_to_theme(file.path, Omarchy.version_name(theme_stem(wallpaper), file.path, crop))
+    end
+
+    # Take one version back out of the theme (the library copy stays, so it can be
+    # added again).
+    def remove_version_from_theme(wallpaper : Wallpaper, file : WallpaperFile) : Nil
+      removed = Omarchy.remove_background(file.path)
+      refresh_theme_info
+      if removed.empty?
+        say "#{file.label} was not in the theme", MUTED
+      else
+        names = removed.map { |p| File.basename(p) }.join(", ")
+        say "removed #{names} from #{Omarchy.current_theme_name || "theme"}", OK
+      end
+    rescue e
+      say e.message || "could not remove from the theme", ERR
+    end
+
+    # ---- which version of a wallpaper goes to the theme
+    #
+    # `wallpaper.files` is the original first, then the crops in order, so the
+    # choice is simply an index into that list. It is remembered per wallpaper
+    # (the chosen file id is stored in `meta`), and falls back to the original when
+    # the chosen version has since been deleted.
+    def chosen_index(wallpaper : Wallpaper) : Int32
+      @version_choice[wallpaper.id] ||= Store.chosen_version_index(wallpaper.id, wallpaper.files)
+    end
+
+    def set_chosen_index(wallpaper : Wallpaper, index : Int32) : Nil
+      return if index < 0 || index >= wallpaper.files.size
+      @version_choice[wallpaper.id] = index
+      if file = wallpaper.files[index]?
+        Store.set_theme_choice(wallpaper.id, file.id)
+      end
+      say "version for the theme: #{wallpaper.files[index].label}", MUTED
+    end
+
+    # Short name of the chosen version, for the action button ("crop 1").
+    def chosen_label(wallpaper : Wallpaper) : String
+      file = chosen_file(wallpaper)
+      return "version" unless file
+      file.kind == "crop" ? "crop #{(file.crop_index || 0_i64) + 1}" : "original"
+    end
+
+    def chosen_file(wallpaper : Wallpaper) : WallpaperFile?
+      index = chosen_index(wallpaper)
+      index = 0 if index >= wallpaper.files.size
+      wallpaper.files[index]?
+    end
+
+    # Add the currently chosen version (used by every "add to theme" button).
+    def add_chosen_to_theme(wallpaper : Wallpaper) : Nil
+      if file = chosen_file(wallpaper)
+        file.exists? ? add_version_to_theme(wallpaper, file) : say("#{File.basename(file.path)} is missing", ERR)
+      else
+        say("no local version yet — queuing the download", WARN)
+        download(wallpaper)
+      end
+    end
+
+    # Versions already present in the theme folder, so the UI can say so.
+    def refresh_theme_names : Nil
+      @theme_names = Omarchy.background_names
+    end
+
+    # Where a listed theme file lives: the folder we add to first, then the
+    # staging copy.
+    def theme_file_path(name : String) : String?
+      target = File.join(Omarchy.backgrounds_dir, name)
+      return target if File.exists?(target)
+      staged = File.join(Omarchy.staged_backgrounds_dir, name)
+      File.exists?(staged) ? staged : nil
+    end
+
+    def delete_theme_file(path : String, name : String) : Nil
+      File.delete(path)
+      refresh_theme_info
+      say "deleted #{name} from #{Omarchy.current_theme_name || "theme"}", OK
+    rescue e
+      say e.message || "could not delete #{name}", ERR
+    end
+
+    def in_theme?(wallpaper : Wallpaper, file : WallpaperFile?) : Bool
+      return false unless file
+      crop = file.kind == "crop" ? file.crop_index : nil
+      name = Omarchy.version_name(theme_stem(wallpaper), file.path, crop)
+      @theme_names.includes?(name)
     end
   end
 end

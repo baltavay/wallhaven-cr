@@ -107,7 +107,7 @@ module Ui
     def picker_scrolled(viewport_y : Int32, viewport_h : Int32, content_h : Int32) : Float32
       mouse = Raylib.get_mouse_position
       inside = Raylib.check_collision_point_rec?(mouse, Ui.rect(SIDEBAR_W, viewport_y, Raylib.get_screen_width - SIDEBAR_W, viewport_h))
-      wheel = inside ? Raylib.get_mouse_wheel_move : 0_f32
+      wheel = (inside && input_ready?) ? Raylib.get_mouse_wheel_move : 0_f32
       value = wheel == 0_f32 ? @picker_scroll : @picker_scroll - wheel * 60_f32
       value.clamp(0_f32, [0_f32, (content_h - viewport_h).to_f32].max)
     end

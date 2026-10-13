@@ -87,6 +87,53 @@ module Ui
 
     @editor_min_zoom : Float32 = 1_f32
 
+    # Multiply the zoom by `factor`, keeping the image point under `anchor` (screen
+    # coordinates) exactly where it is. Public so it can be driven in checks — the
+    # wheel is the only caller in normal use.
+    def editor_zoom_at(anchor : Raylib::Vector2, factor : Float32) : Nil
+      @editor_zoom_wanted = (@editor_zoom * factor).clamp(@editor_min_zoom, 12_f32)
+      @editor_zoom_anchor = anchor
+      apply_pending_zoom
+    end
+
+    # Zoom changes are applied here, before the geometry is rebuilt, because the
+    # anchor correction needs the frame centre from the previous geometry: the
+    # pan must move by exactly the amount that keeps the anchored image point in
+    # place (see Ui::Zoom).
+    private def apply_pending_zoom : Nil
+      wanted = @editor_zoom_wanted
+      anchor = @editor_zoom_anchor
+      if wanted.nil?
+        # The zoom slider writes `@editor_zoom` directly; treat any change since
+        # the last geometry as a centre-anchored zoom.
+        return if @editor_zoom == @editor_zoom_applied
+        wanted = @editor_zoom
+      end
+      from = @editor_zoom_applied
+      return if from <= 0_f32
+
+      ratio = wanted.not_nil! / from
+      if frame = @editor_frame
+        cx = frame.x + frame.width / 2
+        cy = frame.y + frame.height / 2
+        if at = anchor
+          # wheel: the cursor keeps looking at the same image point
+          @editor_pan = Raylib::Vector2.new(
+            x: Ui::Zoom.pan_after_zoom(@editor_pan.x, at.x, cx, ratio),
+            y: Ui::Zoom.pan_after_zoom(@editor_pan.y, at.y, cy, ratio))
+        else
+          # slider: no cursor, so anchor the crop window's centre
+          @editor_pan = Raylib::Vector2.new(
+            x: Ui::Zoom.pan_after_zoom(@editor_pan.x, cx, cx, ratio),
+            y: Ui::Zoom.pan_after_zoom(@editor_pan.y, cy, cy, ratio))
+        end
+      end
+      @editor_zoom = wanted.not_nil!
+      @editor_zoom_applied = @editor_zoom
+      @editor_zoom_wanted = nil
+      @editor_zoom_anchor = nil
+    end
+
     def draw_editor_canvas(view : Raylib::Rectangle, wallpaper : Wallpaper) : Nil
       source = @editor_source
       unless source && source.exists?
@@ -106,9 +153,12 @@ module Ui
         end
       end
 
+      apply_pending_zoom
       geometry = editor_geometry(view, source)
       frame = geometry[:frame]
       image = geometry[:image]
+      @editor_frame = frame
+      @editor_zoom_applied = @editor_zoom
 
       # Remember the mapping so "Create version" uses exactly what was shown.
       sx, sy, sw, sh = geometry[:source_rect]
@@ -151,11 +201,12 @@ module Ui
         Raylib.draw_line(frame.x.to_i, gy.to_i, (frame.x + frame.width).to_i, gy.to_i, Raylib::Color.new(r: 122, g: 162, b: 247, a: 90))
       end
 
-      # interaction: wheel zooms, drag pans
+      # interaction: wheel zooms about the cursor, drag pans
       mouse = Raylib.get_mouse_position
       inside = Raylib.check_collision_point_rec?(mouse, view)
-      wheel = Raylib.get_mouse_wheel_move
-      @editor_zoom = (@editor_zoom * (1_f32 + wheel * 0.12_f32)).clamp(@editor_min_zoom, 12_f32) if wheel != 0_f32 && inside
+      if input_ready? && inside && (steps = Raylib.get_mouse_wheel_move) != 0_f32
+        editor_zoom_at(mouse, 1_f32 + steps * 0.12_f32)
+      end
       if mouse_pressed? && inside
         @editor_dragging = true
       end
@@ -184,10 +235,11 @@ module Ui
       y += 18
       names = @monitors.map(&.label)
       @editor_monitor = @monitors.index { |m| m.name == @editor_target } || 0
-      if dropdown(Ui.rect(x, y, w, 28), names.empty? ? "fallback" : names.join(";"), pointerof(@editor_monitor), pointerof(@drop_monitor))
-        @editor_target = (@monitors[@editor_monitor]? || Monitors::FALLBACK).name
-        @editor_pan = Raylib::Vector2.new(x: 0_f32, y: 0_f32)
-      end
+      dropdown(Ui.rect(x, y, w, 28), names.empty? ? "fallback" : names.join(";"), pointerof(@editor_monitor), pointerof(@drop_monitor))
+      # The list is drawn in the overlay pass and writes the index directly, so the
+      # target is derived from it every frame rather than on a change event.
+      target_monitor = @monitors[@editor_monitor]? || Monitors::FALLBACK
+      @editor_target = target_monitor.name
       y += 36
 
       target = current_monitor
@@ -210,6 +262,22 @@ module Ui
         @editor_zoom = 1_f32
         @editor_pan = Raylib::Vector2.new(x: 0_f32, y: 0_f32)
       end
+      y += 36
+
+      # Add the version currently open in the editor (the source of the crop) to the
+      # theme without leaving this view.
+      if source = @editor_source
+        present = in_theme?(wallpaper, source)
+        if button(Ui.rect(x, y, w, 30), present ? "In theme" : "Add #{source.label} to theme")
+          if present
+            remove_version_from_theme(wallpaper, source)
+          elsif source.exists?
+            add_version_to_theme(wallpaper, source)
+          else
+            say("version file missing", ERR)
+          end
+        end
+      end
       y += 40
       Raylib.draw_line(x, y, x + w, y, BORDER)
       y += 12
@@ -221,17 +289,27 @@ module Ui
         text("none yet", x, y, 13, MUTED)
       end
       @editor_versions.each do |file|
-        text(file.label, x, y, 13, file.exists? ? TEXT : ERR)
-        if file.kind == "crop"
-          if small_button(Ui.rect(x + w - 68, y - 3, 68, 22), "delete")
+        deletable = file.kind == "crop"
+        chip_w = deletable ? 74_f32 : 0_f32
+        text(truncate(file.label, deletable ? 18 : 26), x, y, 13, file.exists? ? TEXT : ERR)
+        present = in_theme?(wallpaper, file)
+        if small_button(Ui.rect(x + w - chip_w - 62, y - 3, 58, 22), present ? "remove" : "add")
+          if present
+            remove_version_from_theme(wallpaper, file)
+          elsif file.exists?
+            add_version_to_theme(wallpaper, file)
+          else
+            say("version file missing", ERR)
+          end
+        end
+        if deletable
+          if small_button(Ui.rect(x + w - 60, y - 3, 60, 22), "delete")
             File.delete(file.path) if File.exists?(file.path)
             Store.delete_file(file.id)
             @editor_versions = Store.files_for(wallpaper.id)
             refresh_favorites
             say "deleted #{File.basename(file.path)}", MUTED
           end
-        elsif file.exists?
-          text("original", x + w - 68, y, 12, MUTED)
         end
         y += 26
       end

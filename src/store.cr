@@ -47,6 +47,21 @@ class Wallpaper
     meta.try(&.["thumbs"]?).try(&.["small"]?).try(&.as_s?)
   end
 
+  # Best remote thumbnail that still shows the whole wallpaper. wallhaven's `small`
+  # and `large` are fixed-aspect crops (300x200 / 432x243 regardless of the real
+  # aspect), while `original` is a fit thumbnail at ~300 px that keeps it — so this
+  # one is preferred for the whole-image tiles.
+  def remote_fit_thumb : String?
+    thumbs = meta.try(&.["thumbs"]?)
+    return nil unless thumbs
+    %w[original large small].each do |size|
+      if url = thumbs[size]?.try(&.as_s?)
+        return url
+      end
+    end
+    nil
+  end
+
   def original_file : WallpaperFile?
     files.find { |f| f.kind == "original" }
   end
@@ -206,6 +221,27 @@ module Store
 
   def self.count_favorites : Int64
     Db.conn.query_one("SELECT COUNT(*) FROM wallpapers WHERE is_favorite = 1", as: Int64)
+  end
+
+  # ---- which version of a wallpaper goes to the theme
+  #
+  # Stored as the chosen file's row id, so it survives restarts and degrades
+  # gracefully: a version that has been deleted simply falls back to the original.
+
+  def self.theme_choice(wallpaper_id : String) : Int64?
+    meta("theme_choice:#{wallpaper_id}").try(&.to_i64?)
+  end
+
+  def self.set_theme_choice(wallpaper_id : String, file_id : Int64) : Nil
+    set_meta("theme_choice:#{wallpaper_id}", file_id.to_s)
+  end
+
+  # Index into `files` (original first, then crops) of the version to use.
+  def self.chosen_version_index(wallpaper_id : String, files : Array(WallpaperFile)) : Int32
+    chosen = theme_choice(wallpaper_id)
+    return 0 unless chosen
+    index = files.index { |f| f.id == chosen }
+    (index || 0).to_i32
   end
 
   def self.meta(key : String) : String?
